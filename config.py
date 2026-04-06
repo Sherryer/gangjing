@@ -8,7 +8,9 @@
 # ============================================================
 
 # ---- 当前使用的提供商 ----
-DEFAULT_PROVIDER = "deepseek"   # 可选: "deepseek" | "claude" | "openai" | "qwen"
+# 可选: "deepseek" | "claude" | "openai" | "qwen" | "local"
+# local = 调用 Sherry1号(OpenClaw Agent) 的能力，无需 API Key
+DEFAULT_PROVIDER = "deepseek"
 
 # ---- DeepSeek（待补充 key） ----
 DEEPSEEK_API_KEY  = "sk-your-deepseek-key"
@@ -56,3 +58,11 @@ DEFAULT_MAX_RETRIES = 3
 
 # 杠精等级默认值（1=温柔杠 / 2=正常杠 / 3=魔鬼杠）
 DEFAULT_CRITIC_LEVEL = 2
+
+# ---- Local Agent（无需 API Key，通过桥接服务调用 Sherry1号） ----
+# 使用步骤：
+#   1. 在 OpenClaw 会话中启动桥接服务: python bridge_server.py
+#   2. 修改 DEFAULT_PROVIDER = "local"
+#   3. 正常在项目终端运行命令
+LOCAL_BRIDGE_URL = "http://localhost:8787"  # 桥接服务地址
+LOCAL_DEFAULT_MODEL = "sherry1"  # 虚拟模型名

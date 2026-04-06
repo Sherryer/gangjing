@@ -1,7 +1,7 @@
 """
 LLM 客户端封装
 ==============
-统一接入 DeepSeek / Claude / OpenAI / Qwen / Venus。
+统一接入 DeepSeek / Claude / OpenAI / Qwen / Venus / Local Agent。
 切换模型只需改 config.py 里的 DEFAULT_PROVIDER。
 
 设计原则：
@@ -15,6 +15,9 @@ import asyncio
 import httpx
 from openai import OpenAI, AsyncOpenAI
 import config
+
+# Local Agent 代理
+from core.local_proxy import call_agent, call_agent_async
 
 
 # ── 构建各提供商的 client ───────────────────────────────────────
@@ -104,6 +107,24 @@ def chat(
     """
     provider = provider or config.DEFAULT_PROVIDER
     max_tokens = max_tokens or config.DEFAULT_MAX_TOKENS
+
+    # ========== Local Agent 模式（无需 API Key）==========
+    if provider == "local":
+        # 提取 system prompt 和 user content
+        system_prompt = ""
+        user_content = ""
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_prompt = msg.get("content", "")
+            elif msg.get("role") == "user":
+                user_content = msg.get("content", "")
+        
+        print(f"[llm_client] 调用 Local Agent (Sherry1号)，消息数={len(messages)}")
+        start = time.time()
+        response = call_agent(system_prompt, user_content, max_tokens)
+        elapsed = time.time() - start
+        print(f"[llm_client] 完成，耗时={elapsed:.1f}s")
+        return response
 
     # 确定模型名
     if model is None:
@@ -214,6 +235,26 @@ async def chat_async(
     并发用法：await asyncio.gather(chat_async(...), chat_async(...))
     """
     provider = provider or config.DEFAULT_PROVIDER
+
+    # ========== Local Agent 模式（无需 API Key）==========
+    if provider == "local":
+        system_prompt = ""
+        user_content = ""
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_prompt = msg.get("content", "")
+            elif msg.get("role") == "user":
+                user_content = msg.get("content", "")
+        
+        tag = f"[{label}]" if label else "[llm_client_async]"
+        print(f"{tag} 调用 Local Agent (Sherry1号)")
+        start = time.time()
+        # 同步调用但在 async 函数中通过线程池执行
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, call_agent_async, system_prompt, user_content, max_tokens)
+        elapsed = time.time() - start
+        print(f"{tag} 完成，耗时={elapsed:.1f}s")
+        return response
 
     model_map = {
         "deepseek": config.DEEPSEEK_MODELS[config.DEEPSEEK_DEFAULT_MODEL],
