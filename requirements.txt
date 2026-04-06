@@ -1,0 +1,11 @@
+# LLM 调用
+openai>=1.30.0
+
+# HTTP 客户端（URL 爬取 + API 调用）
+httpx>=0.27.0
+
+# PDF 解析
+pymupdf>=1.24.0
+
+# 定时任务（Heartbeat）
+apscheduler>=3.10.0
