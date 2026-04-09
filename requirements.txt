@@ -9,3 +9,11 @@ pymupdf>=1.24.0
 
 # 定时任务（Heartbeat）
 apscheduler>=3.10.0
+
+# 视频 ASR（SenseVoice-Small，中文识别最优）
+# 注意：torch 体积较大，首次 pip install 需要一段时间
+funasr>=1.1.0
+modelscope>=1.18.0
+torch>=2.0.0
+torchaudio>=2.0.0
+# ffmpeg 需系统级安装：brew install ffmpeg 或 apt install ffmpeg

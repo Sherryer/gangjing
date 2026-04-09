@@ -9,6 +9,7 @@
   python main.py --input "你的方案..."
   python main.py --url https://example.com/article     # review 网页内容
   python main.py --pdf path/to/report.pdf              # review PDF 文档
+  python main.py --video path/to/demo.mp4              # review 视频字幕内容（ASR）
 
   # 三虾互杠模式：ProposalShrimp 出初稿 → 三虾迭代
   python main.py --mode three --input "帮我写一个 React Popover 组件"
@@ -20,6 +21,8 @@
   --file,     -f   从文件读取内容
   --url,      -u   抓取网页内容并 review（Jina Reader，无需 Key）
   --pdf,           解析 PDF 文件并 review
+  --video,         从视频提取字幕并 review（SenseVoice-Small ASR，中文最优）
+  --lang,          视频语言代码，默认 zh（可选：yue/en/ja/ko/auto）
   --type,     -t   内容类型：auto（默认）| code | business | content
   --level,    -l   杠精等级：1=温柔 2=正常（默认）3=魔鬼
   --provider, -p   LLM 提供商：venus（默认）| deepseek | claude | openai | qwen
@@ -29,7 +32,7 @@
 注意：
   - single 模式：把已有内容直接丢给杠精虾 review
   - three  模式：把"需求描述"丢给三虾，由 ProposalShrimp 先产出初稿再迭代
-  - --url / --pdf 只支持 single 模式
+  - --url / --pdf / --video 只支持 single 模式
 """
 
 import argparse
@@ -46,6 +49,7 @@ from core.critic_shrimp import review
 from core.three_shrimp_workflow import run_workflow, render_workflow_report
 from core.input_adapters.url_fetcher import fetch_url_for_review
 from core.input_adapters.pdf_parser import parse_pdf_for_review
+from core.input_adapters.video_asr import transcribe_video_for_review
 import config
 
 
@@ -209,6 +213,10 @@ def main():
     parser.add_argument("--file",     "-f", type=str,  help="从文件读取内容")
     parser.add_argument("--url",      "-u", type=str,  help="抓取网页内容并 review")
     parser.add_argument("--pdf",            type=str,  help="解析 PDF 并 review")
+    parser.add_argument("--video",          type=str,  help="从视频提取字幕并 review（SenseVoice ASR）")
+    parser.add_argument("--lang",           type=str,  default="zh",
+                        choices=["zh", "yue", "en", "ja", "ko", "auto"],
+                        help="视频语言代码（默认 zh，auto=自动检测）")
     parser.add_argument("--type",     "-t", default="auto",
                         choices=["auto", "code", "business", "content"],
                         help="内容类型（默认 auto 自动识别）")
@@ -248,6 +256,22 @@ def main():
         except RuntimeError as e:
             print(f"❌ {e}")
             sys.exit(1)
+    elif args.video:
+        # 视频 ASR 模式：SenseVoice-Small 提取字幕
+        if args.mode == "three":
+            print("⚠️  --video 不支持 three 模式，已自动切换为 single 模式")
+            args.mode = "single"
+        video_path = str(Path(args.video).resolve())
+        print(f"🎬 正在提取视频字幕：{video_path}（语言: {args.lang}）")
+        print("   首次运行会自动下载 SenseVoice-Small 模型（~234MB），请耐心等待...")
+        try:
+            content = transcribe_video_for_review(video_path, language=args.lang)
+        except RuntimeError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+        # 视频字幕默认走 content review
+        if args.type == "auto":
+            args.type = "content"
     elif args.input:
         content = args.input
     elif args.file:
