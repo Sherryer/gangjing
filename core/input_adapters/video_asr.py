@@ -24,9 +24,10 @@ import re
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from core.input_adapters.models import Segment, ASRResult, _seconds_to_hms
 
 # SenseVoice 支持的语言代码
 SUPPORTED_LANGUAGES = {"zh", "yue", "en", "ja", "ko", "auto"}
@@ -43,77 +44,6 @@ MAX_AUDIO_DURATION = 7200  # 2小时
 # ============================================================
 _model_cache: dict = {}
 _ffmpeg_available: Optional[bool] = None
-
-
-@dataclass
-class Segment:
-    """单条字幕段"""
-    start: float        # 开始时间（秒）
-    end: float          # 结束时间（秒）
-    text: str           # 识别文字
-    emotion: str = ""   # 情绪标签（SenseVoice 特有）
-    event: str = ""     # 音频事件（笑声/掌声等）
-    suspicious: bool = False  # 疑似识别错误（置信度标注）
-
-    @property
-    def start_str(self) -> str:
-        """格式化为 HH:MM:SS"""
-        return _seconds_to_hms(self.start)
-
-    @property
-    def end_str(self) -> str:
-        return _seconds_to_hms(self.end)
-
-
-@dataclass
-class ASRResult:
-    file_path: str
-    segments: list[Segment] = field(default_factory=list)
-    full_text: str = ""           # 无时间戳的纯文字（方便直接 review）
-    duration: float = 0.0         # 视频总时长（秒）
-    language: str = ""            # 检测到的语言
-    success: bool = False
-    warning: str = ""
-    error: str = ""
-    metrics: dict = field(default_factory=dict)  # 各阶段耗时
-
-    def get_metrics_text(self) -> str:
-        """返回各阶段耗时报告"""
-        if not self.metrics:
-            return ""
-        m = self.metrics
-        lines = [
-            "⏱ 各阶段耗时：",
-            f"  音频提取:   {m.get('extract_audio', 0):.2f}s",
-            f"  模型加载:   {m.get('model_load', 0):.2f}s",
-            f"  VAD 分段:   {m.get('vad', 0):.2f}s",
-            f"  ASR 推理:   {m.get('asr_inference', 0):.2f}s",
-            f"  后处理:     {m.get('postprocess', 0):.2f}s",
-            f"  总耗时:     {m.get('total', 0):.2f}s",
-            f"  分段数:     {m.get('segment_count', 0)}",
-            f"  总字符数:   {m.get('char_count', 0)}",
-        ]
-        return "\n".join(lines)
-
-    def get_subtitle_text(self) -> str:
-        """
-        返回带时间戳的字幕文本，格式：
-          [00:01:23 → 00:01:27] 这段话的内容 (情绪: 高兴)
-        """
-        lines = []
-        for seg in self.segments:
-            line = f"[{seg.start_str} → {seg.end_str}] {seg.text}"
-            tags = []
-            if seg.suspicious:
-                tags.append("⚠️ 疑似识别错误")
-            if seg.emotion and seg.emotion not in ("NEUTRAL", ""):
-                tags.append(f"情绪:{seg.emotion}")
-            if seg.event and seg.event not in ("Speech", ""):
-                tags.append(f"事件:{seg.event}")
-            if tags:
-                line += f"  ({', '.join(tags)})"
-            lines.append(line)
-        return "\n".join(lines)
 
 
 # ============================================================
@@ -264,10 +194,11 @@ def transcribe_video(
                              error=f"ASR 处理失败: {type(e).__name__}: {e}",
                              metrics=metrics)
 
-        # --- 后处理：标点切分 → 规则清理 → 置信度标注 ---
+        # --- 后处理：语言策略（标点切分 + 清理 + 标注） ---
         t0 = time.time()
-        segments = _split_segments_by_punctuation(raw_segments)
-        segments = _clean_and_tag_segments(segments)
+        from core.input_adapters.postprocess import get_strategy
+        strategy = get_strategy(language)
+        segments = strategy.process(raw_segments)
         metrics["postprocess"] = time.time() - t0
 
         if not segments:
@@ -465,231 +396,6 @@ def _probe_duration(video_path: str) -> float:
         return 0.0
 
 
-def _split_segments_by_punctuation(segments: list[Segment]) -> list[Segment]:
-    """
-    按句末标点对长段落做二次切分。
-
-    SenseVoice 可能返回一整段长文字，这里按句号/问号/感叹号切成多条，
-    时间戳按字符比例线性插值分配。
-    """
-    # 句末标点（中英文）
-    SENTENCE_ENDS = re.compile(r'([。！？!?；;]+)')
-
-    result: list[Segment] = []
-    for seg in segments:
-        text = seg.text.strip()
-        if not text:
-            continue
-
-        # 短段不切（<50字符或没有句末标点）
-        if len(text) < 50 or not SENTENCE_ENDS.search(text):
-            result.append(seg)
-            continue
-
-        # 按句末标点拆分，保留标点
-        parts = SENTENCE_ENDS.split(text)
-        # 合并：["句子", "。", "句子2", "？"] → ["句子。", "句子2？"]
-        sentences: list[str] = []
-        i = 0
-        while i < len(parts):
-            s = parts[i]
-            # 下一个如果是标点，粘上去
-            if i + 1 < len(parts) and SENTENCE_ENDS.fullmatch(parts[i + 1]):
-                s += parts[i + 1]
-                i += 2
-            else:
-                i += 1
-            s = s.strip()
-            if s:
-                sentences.append(s)
-
-        if len(sentences) <= 1:
-            result.append(seg)
-            continue
-
-        # 按字符比例分配时间
-        total_chars = sum(len(s) for s in sentences)
-        total_duration = seg.end - seg.start
-        current_time = seg.start
-
-        for sentence in sentences:
-            ratio = len(sentence) / total_chars if total_chars > 0 else 1.0 / len(sentences)
-            seg_duration = total_duration * ratio
-            result.append(Segment(
-                start=current_time,
-                end=current_time + seg_duration,
-                text=sentence,
-                emotion=seg.emotion,
-                event=seg.event,
-            ))
-            current_time += seg_duration
-
-    return result
-
-
-# ── 第一层：规则清理 + 第二层：置信度标注 ──────────────────────
-
-# 纯 filler / 语气词（完全匹配时丢弃整段）
-_FILLER_ONLY = re.compile(
-    r'^[呃嗯啊哦哈嗨唉噢嘛呀吧啦额哎呐嘿]*[。，、！？．．．…,.!? ]*$'
-)
-
-# 尾部标点（判断置信度时需要先去掉）
-_TRAILING_PUNCT = re.compile(r'[。！？!?，,、\s]+$')
-_PUNCT_ALL = re.compile(r'[。！？!?，,、\s.…]')
-
-# jieba 延迟加载
-_jieba_loaded = False
-
-
-def _ensure_jieba():
-    global _jieba_loaded
-    if not _jieba_loaded:
-        import jieba
-        jieba.setLogLevel(20)  # 抑制 jieba 的 INFO 日志
-        _jieba_loaded = True
-
-
-def _word_quality_score(text: str) -> float:
-    """
-    分词质量分数：多字词（≥2字符）的字符数占总字符数的比例。
-    返回 0.0 ~ 1.0，越高越可信。
-
-    示例：
-      "不是"     → ["不是"]           → 1.0  ✅
-      "咋介绍"   → ["咋", "介绍"]     → 0.67 ✅
-      "耐吉性"   → ["耐", "吉", "性"] → 0.0  ⚠️
-      "等脸"     → ["等", "脸"]       → 0.0  ⚠️
-    """
-    import jieba
-    _ensure_jieba()
-
-    core = _PUNCT_ALL.sub('', text)
-    if not core:
-        return 0.0
-
-    words = [w for w in jieba.cut(core) if len(w) > 0]
-    if not words:
-        return 0.0
-
-    multi_char_count = sum(len(w) for w in words if len(w) >= 2)
-    return multi_char_count / len(core)
-
-
-def _suspicious_check(seg: 'Segment') -> bool:
-    """
-    多维联合判定是否疑似识别错误。
-
-    策略：表层规则先圈出"候选可疑段"，分词质量高的再捞回来。
-    这样既能标出"等脸""耐吉性"，又不会误标"不是""咋介绍"。
-
-    维度：
-      1. 字符长度 + 时长（表层粗筛）
-      2. 分词可达性（语义层，用于救回正确识别的短段）
-      3. 单字重复（形态层，硬规则）
-    """
-    core = _TRAILING_PUNCT.sub('', seg.text).strip()
-    if not core:
-        return True
-
-    duration = seg.end - seg.start
-
-    # ── 硬规则：单字重复 3 次以上，直接标记 ──
-    if re.search(r'(.)\1{2,}', core):
-        return True
-
-    # ── 长段基本可信 ──
-    if len(core) > 8:
-        return False
-
-    # ── 表层粗筛：短段候选 ──
-    is_candidate = False
-
-    # 极短文字 + 短时长
-    if len(core) <= 3 and duration < 2.0:
-        is_candidate = True
-
-    # 短文字 + 每字不重复（散字特征）
-    if (len(core) <= 5
-            and len(set(core)) == len(core)
-            and duration < 3.0):
-        is_candidate = True
-
-    if not is_candidate:
-        return False
-
-    # ── 分词救回：如果分词能切出有意义的词，则不标记 ──
-    # "不是"(1.0)、"咋介绍"(0.67) 会被救回
-    # "等脸"(0.0) 不会被救回
-    word_score = _word_quality_score(core)
-
-    # 高分词质量 → 尝试救回
-    # 注意：jieba 新词发现可能把乱码也切成"词"（如"耐吉性"），
-    # 所以用词频验证：只有词典中确实存在的高频词才有说服力
-    if word_score >= 0.5:
-        import jieba
-        _ensure_jieba()
-        words = [w for w in jieba.cut(core) if len(w) >= 2]
-        # 检查多字词是否在 jieba 词典中且有词频
-        has_known_word = any(
-            jieba.dt.FREQ.get(w, 0) > 0 for w in words
-        )
-        if has_known_word:
-            return False  # 救回：含有词典中的已知词
-
-    return True
-
-
-def _clean_and_tag_segments(segments: list[Segment]) -> list[Segment]:
-    """
-    第一层：规则清理
-      - 去掉纯 filler 段（"呃"、"嗯"、"哎"等）
-      - 去掉段首重复的 filler 词（"呃，" "嗯，"）
-      - 统一标点为全角
-
-    第二层：置信度标注
-      - 对可能识别错误的段标记 suspicious=True
-      - 不修改原始文字，只打标记
-
-    设计原则：宁可漏标，不可误改。
-    """
-    result: list[Segment] = []
-
-    for seg in segments:
-        text = seg.text.strip()
-
-        # ── 第一层：规则清理 ──
-
-        # 纯 filler 整段丢弃
-        if _FILLER_ONLY.fullmatch(text):
-            continue
-
-        # 去掉段首 filler（"呃，大家好" → "大家好"）
-        text = re.sub(r'^[呃嗯额哎]+[，,、]\s*', '', text)
-
-        # 半角标点 → 全角
-        text = text.replace(',', '，').replace('!', '！').replace('?', '？')
-
-        if not text:
-            continue
-
-        # ── 第二层：置信度标注 ──
-        suspicious = _suspicious_check(
-            Segment(start=seg.start, end=seg.end, text=text)
-        )
-
-        result.append(Segment(
-            start=seg.start,
-            end=seg.end,
-            text=text,
-            emotion=seg.emotion,
-            event=seg.event,
-            suspicious=suspicious,
-        ))
-
-    return result
-
-
 def _parse_tags(raw_text: str) -> tuple[str, str, str]:
     """
     从 SenseVoice 输出的 raw text 中提取情绪标签、事件标签和干净文字。
@@ -720,12 +426,3 @@ def _parse_tags(raw_text: str) -> tuple[str, str, str]:
     clean_text = re.sub(r"<\|[^|]+\|>", "", raw_text).strip()
 
     return emotion, event, clean_text
-
-
-def _seconds_to_hms(seconds: float) -> str:
-    """把秒数转成 HH:MM:SS 格式"""
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
