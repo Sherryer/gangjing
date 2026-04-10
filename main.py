@@ -27,6 +27,8 @@
   --level,    -l   杠精等级：1=温柔 2=正常（默认）3=魔鬼
   --provider, -p   LLM 提供商：venus（默认）| deepseek | claude | openai | qwen
   --output,   -o   指定输出文件路径
+  --html           同时导出 HTML 报告
+  --open           导出 HTML 后自动用浏览器打开
   --no-save        不保存文件，只打印到终端
 
 注意：
@@ -37,58 +39,166 @@
 
 import argparse
 import sys
-import os
-import threading
-import time
 from pathlib import Path
 from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.markdown import Markdown
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.text import Text
+from rich.rule import Rule
+from rich.theme import Theme
 
 from core.critic_shrimp import review
 from core.three_shrimp_workflow import run_workflow, render_workflow_report
 from core.input_adapters.url_fetcher import fetch_url_for_review
 from core.input_adapters.pdf_parser import parse_pdf_for_review
 from core.input_adapters.video_asr import transcribe_video_for_review
+from core.html_exporter import export_html
 import config
 
 
-# ── 进度提示 ────────────────────────────────────────────────────
+# ── Rich Console 全局实例 ────────────────────────────────────────
 
-class Spinner:
-    FRAMES = ["🦐 思考中   ", "🦐 思考中.  ", "🦐 思考中.. ", "🦐 思考中..."]
+SHRIMP_THEME = Theme({
+    "shrimp":     "bold bright_red",
+    "p0":         "bold white on red",
+    "p1":         "bold black on dark_orange",
+    "p2":         "bold black on yellow",
+    "p3":         "bold black on green",
+    "passed":     "bold green",
+    "forced":     "bold yellow",
+    "max_rounds": "bold dark_orange",
+    "level1":     "bold green",
+    "level2":     "bold yellow",
+    "level3":     "bold red",
+    "info":       "dim cyan",
+    "dim":        "dim",
+})
 
-    def __init__(self):
-        self._running = False
-        self._thread = None
+console = Console(theme=SHRIMP_THEME)
+
+LEVEL_STYLE = {1: ("level1", "🟢 温柔杠"), 2: ("level2", "🟡 正常杠"), 3: ("level3", "🔴 魔鬼杠")}
+SHRIMP_ART = "🦐"
+
+
+# ── 头部 Banner ──────────────────────────────────────────────────
+
+def print_banner():
+    console.print()
+    console.print(Panel(
+        Text("🦐  杠精虾  ·  批判性思维 Review 引擎  🦐", justify="center", style="bold bright_red"),
+        subtitle="[dim]让你的方案经得起最刁钻的审查[/dim]",
+        border_style="red",
+        padding=(0, 4),
+    ))
+    console.print()
+
+
+# ── 模式信息面板 ─────────────────────────────────────────────────
+
+def print_mode_panel(mode: str, level: int, content_type: str, provider: str):
+    level_style, level_label = LEVEL_STYLE[level]
+    mode_label = "三虾互杠 🦐🦐🦐" if mode == "three" else "单虾 Review 🦐"
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim", justify="right")
+    table.add_column()
+    table.add_row("模式",   f"[bold]{mode_label}[/bold]")
+    table.add_row("等级",   f"[{level_style}]Level {level}  {level_label}[/{level_style}]")
+    table.add_row("类型",   f"[cyan]{content_type}[/cyan]")
+    table.add_row("提供商", f"[cyan]{provider}[/cyan]")
+
+    console.print(Panel(table, title="[bold]任务配置[/bold]", border_style="bright_black", padding=(0, 1)))
+    console.print()
+
+
+# ── Spinner（单虾等待）───────────────────────────────────────────
+
+class RichSpinner:
+    def __init__(self, label: str = "🦐 杠精虾思考中"):
+        self._progress = Progress(
+            SpinnerColumn("dots", style="bright_red"),
+            TextColumn(f"[bold bright_red]{label}[/bold bright_red]"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        )
+        self._task_id = None
 
     def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._spin, daemon=True)
-        self._thread.start()
+        self._progress.start()
+        self._task_id = self._progress.add_task("thinking")
 
     def stop(self):
-        self._running = False
-        if self._thread:
-            self._thread.join()
-        print("\r" + " " * 40 + "\r", end="", flush=True)
-
-    def _spin(self):
-        i = 0
-        while self._running:
-            print(f"\r{self.FRAMES[i % len(self.FRAMES)]}", end="", flush=True)
-            time.sleep(0.4)
-            i += 1
+        self._progress.stop()
 
 
-# ── 输入读取 ────────────────────────────────────────────────────
+# ── 结果展示 ─────────────────────────────────────────────────────
+
+def print_review_result(report: str, mode: str = "single"):
+    console.print()
+    console.print(Rule("[bold bright_red]Review 结果[/bold bright_red]", style="red"))
+    console.print()
+    try:
+        console.print(Markdown(report))
+    except Exception:
+        console.print(report)
+    console.print()
+
+
+def print_three_shrimp_summary(rounds_info: list[dict], status: str):
+    """打印三虾迭代进度表"""
+    table = Table(show_header=True, header_style="bold", border_style="bright_black", padding=(0, 2))
+    table.add_column("轮次",   justify="center")
+    table.add_column("P0 🔴", justify="center")
+    table.add_column("P1 🟠", justify="center")
+    table.add_column("状态",   justify="center")
+
+    status_map = {
+        "ongoing":     ("🔄 继续", "yellow"),
+        "passed":      ("✅ 通过", "green"),
+        "forced_stop": ("⚠️ 强制终止", "yellow"),
+        "max_rounds":  ("⏰ 达到上限", "dark_orange"),
+    }
+
+    for r in rounds_info:
+        s_label, s_style = status_map.get(r["status"], (r["status"], "white"))
+        table.add_row(
+            f"Round {r['round_num']}",
+            Text(str(r["p0"]), style="bold red" if r["p0"] > 0 else "green"),
+            Text(str(r["p1"]), style="bold dark_orange" if r["p1"] > 0 else "dim"),
+            Text(s_label, style=s_style),
+        )
+
+    final_style = {"passed": "passed", "forced_stop": "forced", "max_rounds": "max_rounds"}.get(status, "white")
+    final_desc  = {"passed": "✅ 终审通过，无 P0 问题", "forced_stop": "⚠️ P0 未收敛，需人工介入", "max_rounds": "⏰ 已达最大轮次"}.get(status, status)
+
+    console.print(Panel(
+        table,
+        title="[bold]三虾互杠迭代记录[/bold]",
+        subtitle=f"[{final_style}]{final_desc}[/{final_style}]",
+        border_style="bright_black",
+    ))
+
+
+# ── 输入读取 ─────────────────────────────────────────────────────
 
 def read_from_stdin(mode: str) -> str:
     if mode == "three":
-        print("📋 请输入你的需求（ProposalShrimp 将据此产出初稿），Ctrl+D 提交：")
+        console.print(Panel(
+            "[dim]请输入你的需求（ProposalShrimp 将据此产出初稿），[bold]Ctrl+D[/bold] 提交[/dim]",
+            border_style="bright_black",
+        ))
     else:
-        print("📋 请粘贴要审查的内容，Ctrl+D 提交：")
-    print("─" * 60)
+        console.print(Panel(
+            "[dim]请粘贴要审查的内容，[bold]Ctrl+D[/bold] 提交[/dim]",
+            border_style="bright_black",
+        ))
     lines = []
     try:
         while True:
@@ -101,17 +211,17 @@ def read_from_stdin(mode: str) -> str:
 def read_from_file(file_path: str) -> str:
     path = Path(file_path)
     if not path.exists():
-        print(f"❌ 文件不存在：{file_path}")
+        console.print(f"[bold red]❌ 文件不存在：{file_path}[/bold red]")
         sys.exit(1)
     content = path.read_text(encoding="utf-8")
     if not content.strip():
-        print(f"❌ 文件内容为空：{file_path}")
+        console.print(f"[bold red]❌ 文件内容为空：{file_path}[/bold red]")
         sys.exit(1)
-    print(f"📄 已读取文件：{file_path}（{len(content)} 字符）")
+    console.print(f"[info]📄 已读取文件：{file_path}（{len(content)} 字符）[/info]")
     return content
 
 
-# ── 输出保存 ────────────────────────────────────────────────────
+# ── 输出保存 ─────────────────────────────────────────────────────
 
 def save_output(content: str, output_path: str | None, prefix: str, content_type: str, level: int) -> str:
     if output_path:
@@ -126,17 +236,12 @@ def save_output(content: str, output_path: str | None, prefix: str, content_type
     return str(save_path)
 
 
-# ── 单虾模式 ────────────────────────────────────────────────────
+# ── 单虾模式 ─────────────────────────────────────────────────────
 
 def run_single_mode(content: str, args) -> str:
-    level_names = {1: "🟢 温柔杠", 2: "🟡 正常杠", 3: "🔴 魔鬼杠"}
-    print(f"\n{'─'*60}")
-    print(f"  模式：单虾 review")
-    print(f"  等级：Level {args.level} {level_names[args.level]}")
-    print(f"  类型：{args.type}  提供商：{args.provider or config.DEFAULT_PROVIDER}")
-    print(f"{'─'*60}\n")
+    print_mode_panel("single", args.level, args.type, args.provider or config.DEFAULT_PROVIDER)
 
-    spinner = Spinner()
+    spinner = RichSpinner("杠精虾 审查中")
     spinner.start()
     try:
         report = review(
@@ -147,7 +252,7 @@ def run_single_mode(content: str, args) -> str:
         )
     except KeyboardInterrupt:
         spinner.stop()
-        print("\n⚠️  已中断")
+        console.print("\n[yellow]⚠️  已中断[/yellow]")
         sys.exit(0)
     except Exception as e:
         spinner.stop()
@@ -157,15 +262,10 @@ def run_single_mode(content: str, args) -> str:
     return report
 
 
-# ── 三虾模式 ────────────────────────────────────────────────────
+# ── 三虾模式 ─────────────────────────────────────────────────────
 
 def run_three_mode(request: str, args) -> str:
-    level_names = {1: "🟢 温柔杠", 2: "🟡 正常杠", 3: "🔴 魔鬼杠"}
-    print(f"\n{'─'*60}")
-    print(f"  模式：三虾互杠")
-    print(f"  等级：Level {args.level} {level_names[args.level]}")
-    print(f"  类型：{args.type}  提供商：{args.provider or config.DEFAULT_PROVIDER}")
-    print(f"{'─'*60}\n")
+    print_mode_panel("three", args.level, args.type, args.provider or config.DEFAULT_PROVIDER)
 
     try:
         result = run_workflow(
@@ -175,26 +275,38 @@ def run_three_mode(request: str, args) -> str:
             provider=args.provider,
         )
     except KeyboardInterrupt:
-        print("\n⚠️  已中断")
+        console.print("\n[yellow]⚠️  已中断[/yellow]")
         sys.exit(0)
     except Exception as e:
         _print_error(e)
         sys.exit(1)
 
+    # 打印迭代摘要表
+    rounds_info = [
+        {"round_num": r.round_num, "p0": r.p0_count, "p1": r.p1_count, "status": r.status}
+        for r in result.rounds
+    ]
+    console.print()
+    print_three_shrimp_summary(rounds_info, result.status)
+
     return render_workflow_report(result)
 
 
-# ── 错误提示 ────────────────────────────────────────────────────
+# ── 错误提示 ─────────────────────────────────────────────────────
 
 def _print_error(e: Exception):
-    print(f"\n❌ 失败：{type(e).__name__}: {e}")
-    print("\n可能的原因：")
-    print("  1. API Key 无效或过期 → 检查 config.py")
-    print("  2. 网络问题 → 检查网络连接")
-    print("  3. 模型名称错误 → 检查 config.py 中的模型配置")
+    console.print(Panel(
+        f"[bold red]{type(e).__name__}[/bold red]: {e}\n\n"
+        "[dim]可能的原因：\n"
+        "  1. API Key 无效或过期 → 检查 config.py\n"
+        "  2. 网络问题 → 检查网络连接\n"
+        "  3. 模型名称错误 → 检查 config.py 中的模型配置[/dim]",
+        title="[bold red]❌ 调用失败[/bold red]",
+        border_style="red",
+    ))
 
 
-# ── 主入口 ──────────────────────────────────────────────────────
+# ── 主入口 ───────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
@@ -205,6 +317,7 @@ def main():
   python main.py --file mycode.py                          # 单虾 review 代码文件
   python main.py --file plan.md --type business --level 3 # 魔鬼级商业方案 review
   python main.py --mode three --input "写一个登录组件"     # 三虾互杠：需求→初稿→迭代
+  python main.py --file code.py --html --open              # 导出 HTML 并自动打开浏览器
         """
     )
     parser.add_argument("--mode",     "-m", default="single", choices=["single", "three"],
@@ -224,54 +337,56 @@ def main():
                         choices=[1, 2, 3], help="杠精等级 1/2/3（默认 2）")
     parser.add_argument("--provider", "-p", type=str, default=None,
                         choices=["venus", "deepseek", "claude", "openai", "qwen"])
-    parser.add_argument("--output",   "-o", type=str,  help="输出文件路径")
-    parser.add_argument("--no-save",        action="store_true", help="不保存文件")
+    parser.add_argument("--output",   "-o", type=str,  help="输出文件路径（.md）")
+    parser.add_argument("--html",           action="store_true", help="同时导出 HTML 报告")
+    parser.add_argument("--open",           action="store_true", help="导出 HTML 后自动用浏览器打开")
+    parser.add_argument("--no-save",        action="store_true", help="不保存文件，只打印到终端")
 
     args = parser.parse_args()
 
+    print_banner()
+
     # ① 获取输入内容
     if args.url:
-        # URL 模式：Jina Reader 抓取网页
         if args.mode == "three":
-            print("⚠️  --url 不支持 three 模式，已自动切换为 single 模式")
+            console.print("[yellow]⚠️  --url 不支持 three 模式，已自动切换为 single 模式[/yellow]")
             args.mode = "single"
-        print(f"🌐 正在抓取网页：{args.url}")
+        console.print(f"[info]🌐 正在抓取网页：{args.url}[/info]")
         try:
             content = fetch_url_for_review(args.url)
         except RuntimeError as e:
-            print(f"❌ {e}")
+            console.print(f"[bold red]❌ {e}[/bold red]")
             sys.exit(1)
-        # URL 内容多为文章，默认 content 类型
         if args.type == "auto":
             args.type = "content"
+
     elif args.pdf:
-        # PDF 模式：PyMuPDF 解析
         if args.mode == "three":
-            print("⚠️  --pdf 不支持 three 模式，已自动切换为 single 模式")
+            console.print("[yellow]⚠️  --pdf 不支持 three 模式，已自动切换为 single 模式[/yellow]")
             args.mode = "single"
-        pdf_path = str(Path(args.pdf).resolve())   # 转绝对路径，避免 cwd 歧义
-        print(f"📄 正在解析 PDF：{pdf_path}")
+        pdf_path = str(Path(args.pdf).resolve())
+        console.print(f"[info]📄 正在解析 PDF：{pdf_path}[/info]")
         try:
             content = parse_pdf_for_review(pdf_path)
         except RuntimeError as e:
-            print(f"❌ {e}")
+            console.print(f"[bold red]❌ {e}[/bold red]")
             sys.exit(1)
+
     elif args.video:
-        # 视频 ASR 模式：SenseVoice-Small 提取字幕
         if args.mode == "three":
-            print("⚠️  --video 不支持 three 模式，已自动切换为 single 模式")
+            console.print("[yellow]⚠️  --video 不支持 three 模式，已自动切换为 single 模式[/yellow]")
             args.mode = "single"
         video_path = str(Path(args.video).resolve())
-        print(f"🎬 正在提取视频字幕：{video_path}（语言: {args.lang}）")
-        print("   首次运行会自动下载 SenseVoice-Small 模型（~234MB），请耐心等待...")
+        console.print(f"[info]🎬 正在提取视频字幕：{video_path}（语言: {args.lang}）[/info]")
+        console.print("[dim]   首次运行会自动下载 SenseVoice-Small 模型（~234MB），请耐心等待...[/dim]")
         try:
             content = transcribe_video_for_review(video_path, language=args.lang)
         except RuntimeError as e:
-            print(f"❌ {e}")
+            console.print(f"[bold red]❌ {e}[/bold red]")
             sys.exit(1)
-        # 视频字幕默认走 content review
         if args.type == "auto":
             args.type = "content"
+
     elif args.input:
         content = args.input
     elif args.file:
@@ -280,7 +395,7 @@ def main():
         content = read_from_stdin(args.mode)
 
     if not content.strip():
-        print("❌ 内容为空，已退出")
+        console.print("[bold red]❌ 内容为空，已退出[/bold red]")
         sys.exit(0)
 
     # ② 运行对应模式
@@ -292,17 +407,39 @@ def main():
         prefix = "review"
 
     # ③ 打印结果
-    print("\n" + "═" * 60)
-    print(output)
-    print("═" * 60)
+    print_review_result(output, args.mode)
 
     # ④ 保存文件
+    saved_md = None
     if not args.no_save:
         file_type = args.type if args.type != "auto" else "auto"
-        saved_path = save_output(output, args.output, prefix, file_type, args.level)
-        print(f"\n💾 已保存到：{saved_path}")
+        saved_md = save_output(output, args.output, prefix, file_type, args.level)
+        console.print(f"[info]💾 Markdown 已保存：{saved_md}[/info]")
 
-    print()
+    # ⑤ HTML 导出（--no-save 时也允许导出 HTML，用临时路径）
+    if args.html or args.open:
+        file_type = args.type if args.type != "auto" else "auto"
+        if saved_md:
+            html_path = saved_md.replace(".md", ".html") if saved_md.endswith(".md") else saved_md + ".html"
+        else:
+            output_dir = Path(__file__).parent / "outputs"
+            output_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            html_path = str(output_dir / f"{prefix}_{file_type}_L{args.level}_{timestamp}.html")
+        export_html(
+            markdown_content=output,
+            output_path=html_path,
+            mode=args.mode,
+            level=args.level,
+            content_type=file_type,
+            provider=args.provider or config.DEFAULT_PROVIDER,
+            auto_open=args.open,
+        )
+        console.print(f"[info]🌐 HTML 已导出：{html_path}[/info]")
+        if args.open:
+            console.print("[dim]   正在用浏览器打开...[/dim]")
+
+    console.print()
 
 
 if __name__ == "__main__":
