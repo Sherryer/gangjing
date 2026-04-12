@@ -24,6 +24,10 @@ venv/
 # 探针输出（不提交中间结果）
 probe/outputs/
 
+# Frontend data (cleaned chat history - sensitive!)
+frontEnd/data/sessions.json
+frontEnd/data/messages/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
